@@ -59,17 +59,17 @@ async function downloadHLS(m3u8Url, filename, tabId) {
     // segment to its playlist position instead of trusting raw TS timestamps.
     const mp4Bytes = await remuxTsToMp4(segmentBuffers, segmentDurations);
 
-    // ── Step 4: Defragment fMP4 → flat MP4 using toMp4.js ───────────────────
-    // mux.js outputs fragmented MP4 (moof+mdat per segment). toMp4.fromFmp4()
-    // reconstructs a standard flat MP4 with a full stbl sample table in moov,
-    // equivalent to: ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4
+    // ── Step 4: Defragment fMP4 → flat MP4 ───────────────────────────────────
+    // mux.js outputs fMP4 (ftyp + moov + moof+mdat pairs). We rebuild it as a
+    // standard flat MP4: collect all mdat payloads, reconstruct stbl from trun
+    // entries, remove mvex from moov, write moov + single mdat.
     sendProgress(tabId, "mux", 88, "Finalizing MP4…");
     let finalBytes;
     try {
-      finalBytes = toMp4.fromFmp4(mp4Bytes);
+      finalBytes = defragmentFmp4(mp4Bytes);
     } catch (e) {
-      console.warn("[offscreen] toMp4 defrag failed, using fMP4:", e.message);
-      finalBytes = mp4Bytes; // fallback: still a valid (fragmented) MP4
+      console.warn("[offscreen] defrag failed, using fMP4:", e.message);
+      finalBytes = mp4Bytes;
     }
 
     sendProgress(tabId, "done", 95, "Creating download…");
@@ -181,6 +181,469 @@ function transmuxOneSegment(tsData, baseMediaDecodeTime) {
   });
 }
 
+
+// ─── fMP4 → flat MP4 defragmenter ────────────────────────────────────────────
+// Converts mux.js fMP4 output into a standard progressive MP4.
+// mux.js always produces: ftyp, moov (with mvex/trex), then N×(moof+mdat).
+// We parse the box tree, extract samples from trun entries, collect all mdat
+// payload bytes, rebuild stbl boxes in each trak, strip mvex, and write a
+// single flat file: ftyp + moov + mdat.
+
+function defragmentFmp4(src) {
+  const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+
+  // ── Box reader ──────────────────────────────────────────────────────────────
+  function readBox(offset) {
+    if (offset + 8 > src.length) return null;
+    let size = view.getUint32(offset);
+    if (size === 1) {
+      if (offset + 16 > src.length) return null;
+      size = view.getUint32(offset + 8) * 0x100000000 + view.getUint32(offset + 12);
+    }
+    if (size < 8 || offset + size > src.length) return null;
+    const type = String.fromCharCode(src[offset+4], src[offset+5], src[offset+6], src[offset+7]);
+    return { type, offset, size, dataOffset: offset + 8 };
+  }
+
+  function childBoxes(offset, end) {
+    const boxes = [];
+    let pos = offset;
+    while (pos < end) {
+      const b = readBox(pos);
+      if (!b) break;
+      boxes.push(b);
+      pos += b.size;
+    }
+    return boxes;
+  }
+
+  function findBox(offset, end, type) {
+    return childBoxes(offset, end).find(b => b.type === type) || null;
+  }
+
+  function readU8(o)  { return src[o]; }
+  function readU16(o) { return view.getUint16(o); }
+  function readU32(o) { return view.getUint32(o); }
+  function readU64(o) { return view.getUint32(o) * 0x100000000 + view.getUint32(o + 4); }
+
+  // ── Parse top-level boxes ────────────────────────────────────────────────────
+  const top = childBoxes(0, src.length);
+  const ftypBox = top.find(b => b.type === "ftyp");
+  const moovBox = top.find(b => b.type === "moov");
+  const moofMdatPairs = [];
+
+  for (let i = 0; i < top.length; i++) {
+    if (top[i].type === "moof" && top[i+1]?.type === "mdat") {
+      moofMdatPairs.push({ moof: top[i], mdat: top[i+1] });
+    }
+  }
+
+  if (!moovBox || moofMdatPairs.length === 0) throw new Error("Not a valid fMP4");
+
+  // ── Parse moov: find trak boxes and their track IDs ─────────────────────────
+  const moovEnd  = moovBox.offset + moovBox.size;
+  const trakBoxes = childBoxes(moovBox.dataOffset, moovEnd).filter(b => b.type === "trak");
+
+  // For each track: collect samples = { duration, size, flags, cts }
+  // and the corresponding raw mdat slice offsets.
+  const tracks = trakBoxes.map(trak => {
+    const tkhdBox = findBox(trak.dataOffset, trak.offset + trak.size, "tkhd");
+    const version = tkhdBox ? readU8(tkhdBox.dataOffset) : 0;
+    const trackId = tkhdBox
+      ? (version === 1 ? readU32(tkhdBox.dataOffset + 20) : readU32(tkhdBox.dataOffset + 12))
+      : 0;
+    return { trak, trackId, samples: [], totalSize: 0 };
+  });
+
+  const trackById = new Map(tracks.map(t => [t.trackId, t]));
+
+  // ── Parse trex defaults from mvex ───────────────────────────────────────────
+  const mvexBox = findBox(moovBox.dataOffset, moovEnd, "mvex");
+  const trexDefaults = new Map();
+  if (mvexBox) {
+    childBoxes(mvexBox.dataOffset, mvexBox.offset + mvexBox.size)
+      .filter(b => b.type === "trex")
+      .forEach(trex => {
+        const o = trex.dataOffset;
+        trexDefaults.set(readU32(o + 4), { // track_ID
+          defaultSampleDuration: readU32(o + 8),
+          defaultSampleSize:     readU32(o + 12),
+          defaultSampleFlags:    readU32(o + 16),
+        });
+      });
+  }
+
+  // ── Collect all mdat payloads in order ──────────────────────────────────────
+  const mdatChunks = [];
+  let mdatTotalSize = 0;
+
+  for (const { moof, mdat } of moofMdatPairs) {
+    const moofEnd = moof.offset + moof.size;
+
+    // mdat payload starts after 8-byte header
+    const mdatPayload = src.slice(mdat.offset + 8, mdat.offset + mdat.size);
+    const mdatPayloadOffset = mdatTotalSize; // offset in the final combined mdat
+
+    // Parse traf boxes inside this moof
+    const trafBoxes = childBoxes(moof.dataOffset, moofEnd).filter(b => b.type === "traf");
+
+    for (const traf of trafBoxes) {
+      const trafEnd = traf.offset + traf.size;
+      const tfhdBox = findBox(traf.dataOffset, trafEnd, "tfhd");
+      if (!tfhdBox) continue;
+
+      const tfhdOff = tfhdBox.dataOffset;
+      const tfhdFlags = readU32(tfhdOff) & 0xFFFFFF;
+      const tfhdVersion = readU8(tfhdOff);
+      let tfhdPos = tfhdOff + 4;
+      const trackId = readU32(tfhdPos); tfhdPos += 4;
+
+      const trex = trexDefaults.get(trackId) || {};
+      let baseDataOffset = mdat.offset + 8; // default: start of mdat payload
+
+      if (tfhdFlags & 0x000001) { tfhdPos += 8; } // base_data_offset present
+      if (tfhdFlags & 0x000002) { tfhdPos += 4; } // sample_description_index
+      const defaultDuration = (tfhdFlags & 0x000008) ? readU32(tfhdPos) : (trex.defaultSampleDuration || 0);
+      if (tfhdFlags & 0x000008) tfhdPos += 4;
+      const defaultSize     = (tfhdFlags & 0x000010) ? readU32(tfhdPos) : (trex.defaultSampleSize || 0);
+      if (tfhdFlags & 0x000010) tfhdPos += 4;
+      const defaultFlags    = (tfhdFlags & 0x000020) ? readU32(tfhdPos) : (trex.defaultSampleFlags || 0);
+
+      const track = trackById.get(trackId);
+      if (!track) continue;
+
+      // Parse trun boxes
+      const trunBoxes = childBoxes(traf.dataOffset, trafEnd).filter(b => b.type === "trun");
+      let dataOffset = 0; // relative to mdat start
+
+      for (const trun of trunBoxes) {
+        const trunOff = trun.dataOffset;
+        const trunFlags = readU32(trunOff) & 0xFFFFFF;
+        let trunPos = trunOff + 4;
+        const sampleCount = readU32(trunPos); trunPos += 4;
+
+        if (trunFlags & 0x001) { dataOffset = view.getInt32(trunPos); trunPos += 4; }
+        if (trunFlags & 0x004) { trunPos += 4; } // first_sample_flags
+
+        for (let s = 0; s < sampleCount; s++) {
+          const duration = (trunFlags & 0x100) ? readU32(trunPos) : defaultDuration; if (trunFlags & 0x100) trunPos += 4;
+          const size     = (trunFlags & 0x200) ? readU32(trunPos) : defaultSize;     if (trunFlags & 0x200) trunPos += 4;
+          const flags    = (trunFlags & 0x400) ? readU32(trunPos) : defaultFlags;    if (trunFlags & 0x400) trunPos += 4;
+          const cts      = (trunFlags & 0x800) ? view.getInt32(trunPos) : 0;         if (trunFlags & 0x800) trunPos += 4;
+
+          const sampleFileOffset = mdatPayloadOffset + dataOffset;
+          dataOffset += size;
+
+          track.samples.push({ duration, size, flags, cts, offset: sampleFileOffset });
+          track.totalSize += size;
+        }
+      }
+    }
+
+    mdatChunks.push(mdatPayload);
+    mdatTotalSize += mdatPayload.byteLength;
+  }
+
+  // ── Rebuild moov without mvex, with stbl rebuilt for each trak ──────────────
+  const newMoov = rebuildMoov(src, moovBox, tracks, mdatTotalSize);
+
+  // ── Assemble: ftyp + moov + mdat ────────────────────────────────────────────
+  const ftypBytes = ftypBox ? src.slice(ftypBox.offset, ftypBox.offset + ftypBox.size) : new Uint8Array(0);
+
+  // Rewrite ftyp compatible_brands to include isom+iso2+avc1+mp41
+  const newFtyp = buildFtyp();
+
+  const mdatHeader = new Uint8Array(8);
+  new DataView(mdatHeader.buffer).setUint32(0, mdatTotalSize + 8);
+  mdatHeader[4] = 109; mdatHeader[5] = 100; mdatHeader[6] = 97; mdatHeader[7] = 116; // "mdat"
+
+  const totalLen = newFtyp.byteLength + newMoov.byteLength + 8 + mdatTotalSize;
+  const out = new Uint8Array(totalLen);
+  let pos = 0;
+  out.set(newFtyp, pos); pos += newFtyp.byteLength;
+  out.set(newMoov, pos); pos += newMoov.byteLength;
+  out.set(mdatHeader, pos); pos += 8;
+  for (const chunk of mdatChunks) { out.set(chunk, pos); pos += chunk.byteLength; }
+
+  return out;
+}
+
+// ── Box builders ────────────────────────────────────────────────────────────
+
+function buildFtyp() {
+  // ftyp: major=isom, minor=0x200, compatible: isom iso2 avc1 mp41
+  const brands = ["isom", "iso2", "avc1", "mp41"];
+  const size = 8 + 4 + 4 + brands.length * 4;
+  const buf = new Uint8Array(size);
+  const v = new DataView(buf.buffer);
+  v.setUint32(0, size);
+  buf.set([102,116,121,112], 4); // "ftyp"
+  buf.set([105,115,111,109], 8); // major "isom"
+  v.setUint32(12, 0x200);        // minor version 512
+  brands.forEach((b, i) => { for (let j=0;j<4;j++) buf[16 + i*4 + j] = b.charCodeAt(j); });
+  return buf;
+}
+
+function rebuildMoov(src, moovBox, tracks, mdatSize) {
+  // We'll reconstruct moov by copying everything except mvex,
+  // and replacing each trak's minf/stbl with rebuilt sample tables.
+  // The chunk offset (stco) for each track points into the single mdat.
+
+  // Compute moov offset in final file: ftyp(24) + moov_size + 8(mdat header)
+  // We'll use a two-pass approach: first compute sizes, then write.
+
+  const parts = [];
+
+  // moov children: copy everything except mvex; rebuild trak boxes
+  const moovEnd = moovBox.offset + moovBox.size;
+  const moovChildren = childBoxesFrom(src, moovBox.dataOffset, moovEnd);
+
+  const rebuiltTraks = tracks.map(t => rebuildTrak(src, t, 0)); // stco placeholder
+
+  // Compute total moov size
+  let moovBodySize = 0;
+  for (const child of moovChildren) {
+    if (child.type === "mvex") continue;
+    if (child.type === "trak") continue;
+    moovBodySize += child.size;
+  }
+  for (const rt of rebuiltTraks) moovBodySize += rt.byteLength;
+
+  const moovSize = 8 + moovBodySize;
+
+  // moov starts right after ftyp (24 bytes)
+  const ftypSize = 24;
+  const moovStartInFile = ftypSize;
+  const mdatStartInFile = moovStartInFile + moovSize + 8; // +8 for mdat header... wait no
+  // Actually: file = ftyp + moov + mdat
+  // mdatPayloadStart = ftypSize + moovSize + 8
+
+  // Rebuild traks with correct stco offsets
+  let trackOffset = ftypSize + moovSize + 8; // start of mdat payload in file
+  const rebuiltTraksFinal = tracks.map(t => {
+    const trak = rebuildTrak(src, t, trackOffset);
+    trackOffset += t.totalSize;
+    return trak;
+  });
+
+  // Assemble moov
+  let bodySize = 0;
+  for (const child of moovChildren) {
+    if (child.type === "mvex" || child.type === "trak") continue;
+    bodySize += child.size;
+  }
+  for (const rt of rebuiltTraksFinal) bodySize += rt.byteLength;
+
+  const moov = new Uint8Array(8 + bodySize);
+  const mv = new DataView(moov.buffer);
+  mv.setUint32(0, 8 + bodySize);
+  moov.set([109,111,111,118], 4); // "moov"
+  let mpos = 8;
+
+  for (const child of moovChildren) {
+    if (child.type === "mvex" || child.type === "trak") continue;
+    moov.set(src.slice(child.offset, child.offset + child.size), mpos);
+    mpos += child.size;
+  }
+  for (const rt of rebuiltTraksFinal) {
+    moov.set(rt, mpos);
+    mpos += rt.byteLength;
+  }
+
+  // Patch mvhd duration: use track[0] total duration in movie timescale
+  // Find mvhd in moov and patch duration
+  patchMvhdDuration(moov, tracks);
+
+  return moov;
+}
+
+function childBoxesFrom(src, start, end) {
+  const boxes = [];
+  let pos = start;
+  const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+  while (pos < end) {
+    if (pos + 8 > src.length) break;
+    let size = view.getUint32(pos);
+    if (size === 1 && pos + 16 <= src.length) size = view.getUint32(pos + 8) * 0x100000000 + view.getUint32(pos + 12);
+    if (size < 8 || pos + size > src.length) break;
+    const type = String.fromCharCode(src[pos+4], src[pos+5], src[pos+6], src[pos+7]);
+    boxes.push({ type, offset: pos, size, dataOffset: pos + 8 });
+    pos += size;
+  }
+  return boxes;
+}
+
+function rebuildTrak(src, track, chunkOffset) {
+  // Copy trak as-is but rebuild the stbl inside minf/mdia
+  const trakBox = track.trak;
+  const trakEnd = trakBox.offset + trakBox.size;
+  const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+
+  const mdiaBox = childBoxesFrom(src, trakBox.dataOffset, trakEnd).find(b => b.type === "mdia");
+  if (!mdiaBox) return src.slice(trakBox.offset, trakBox.offset + trakBox.size);
+
+  const mdiaEnd = mdiaBox.offset + mdiaBox.size;
+  const minfBox = childBoxesFrom(src, mdiaBox.dataOffset, mdiaEnd).find(b => b.type === "minf");
+  if (!minfBox) return src.slice(trakBox.offset, trakBox.offset + trakBox.size);
+
+  const minfEnd = minfBox.offset + minfBox.size;
+  const stblBox = childBoxesFrom(src, minfBox.dataOffset, minfEnd).find(b => b.type === "stbl");
+  if (!stblBox) return src.slice(trakBox.offset, trakBox.offset + trakBox.size);
+
+  // Get timescale from mdhd
+  const mdhdBox = childBoxesFrom(src, mdiaBox.dataOffset, mdiaEnd).find(b => b.type === "mdhd");
+  const mdhdVersion = mdhdBox ? src[mdhdBox.dataOffset] : 0;
+  const timescale = mdhdBox
+    ? (mdhdVersion === 1 ? view.getUint32(mdhdBox.dataOffset + 20) : view.getUint32(mdhdBox.dataOffset + 12))
+    : 90000;
+
+  // Extract stsd from original stbl to carry over codec info
+  const stsdBox = childBoxesFrom(src, stblBox.dataOffset, stblBox.offset + stblBox.size)
+    .find(b => b.type === "stsd");
+  const stsdBytes = stsdBox ? src.slice(stsdBox.offset, stsdBox.offset + stsdBox.size) : null;
+
+  const newStbl = buildStbl(track.samples, chunkOffset, timescale, stsdBytes);
+
+  // Rebuild minf: copy everything except old stbl, add new stbl
+  const newMinf = rebuildContainer(src, minfBox, [{ type: "stbl", replace: newStbl }]);
+  // Rebuild mdia: copy everything except old minf, add new minf
+  const newMdia = rebuildContainer(src, mdiaBox, [{ type: "minf", replace: newMinf }]);
+  // Rebuild trak: copy everything except old mdia, add new mdia
+  const newTrak = rebuildContainer(src, trakBox, [{ type: "mdia", replace: newMdia }]);
+
+  return newTrak;
+}
+
+function rebuildContainer(src, box, replacements) {
+  const end = box.offset + box.size;
+  const children = childBoxesFrom(src, box.dataOffset, end);
+  const replaceMap = new Map(replacements.map(r => [r.type, r.replace]));
+
+  let bodySize = 0;
+  for (const child of children) {
+    const rep = replaceMap.get(child.type);
+    bodySize += rep ? rep.byteLength : child.size;
+  }
+
+  const out = new Uint8Array(8 + bodySize);
+  const v = new DataView(out.buffer);
+  v.setUint32(0, 8 + bodySize);
+  for (let i = 0; i < 4; i++) out[4 + i] = src[box.offset + 4 + i]; // copy type
+  let pos = 8;
+  for (const child of children) {
+    const rep = replaceMap.get(child.type);
+    if (rep) {
+      out.set(rep, pos); pos += rep.byteLength;
+    } else {
+      out.set(src.slice(child.offset, child.offset + child.size), pos); pos += child.size;
+    }
+  }
+  return out;
+}
+
+function buildStbl(samples, chunkOffset, timescale, stsdBytes) {
+  // Build: stsd(copied), stts, ctts, stss, stsz, stsc, stco
+  // We use one sample per chunk (simplest valid layout)
+  const n = samples.length;
+
+  // stts: run-length of durations
+  const sttsEntries = [];
+  if (n > 0) {
+    let count = 1, dur = samples[0].duration;
+    for (let i = 1; i < n; i++) {
+      if (samples[i].duration === dur) { count++; }
+      else { sttsEntries.push(count, dur); count = 1; dur = samples[i].duration; }
+    }
+    sttsEntries.push(count, dur);
+  }
+  const stts = buildFullBox("stts", 0, 0, [sttsEntries.length / 2, ...sttsEntries], 4);
+
+  // ctts: composition time offsets (only if any non-zero)
+  let ctts = null;
+  if (samples.some(s => s.cts !== 0)) {
+    const cttsEntries = [];
+    let count = 1, cts = samples[0].cts;
+    for (let i = 1; i < n; i++) {
+      if (samples[i].cts === cts) { count++; }
+      else { cttsEntries.push(count, cts); count = 1; cts = samples[i].cts; }
+    }
+    cttsEntries.push(count, cts);
+    ctts = buildFullBox("ctts", 1, 0, [cttsEntries.length / 2, ...cttsEntries], 4);
+  }
+
+  // stss: sync sample table (keyframes — flag bit 0x02000000 NOT set = sync)
+  const syncSamples = [];
+  for (let i = 0; i < n; i++) {
+    if ((samples[i].flags & 0x10000) === 0) syncSamples.push(i + 1); // 1-indexed
+  }
+  const stss = syncSamples.length > 0 && syncSamples.length < n
+    ? buildFullBox("stss", 0, 0, [syncSamples.length, ...syncSamples], 4)
+    : null;
+
+  // stsz: sample sizes
+  const stsz = buildFullBox("stsz", 0, 0, [0, n, ...samples.map(s => s.size)], 4);
+
+  // stsc: sample-to-chunk (1 sample per chunk)
+  const stsc = buildFullBox("stsc", 0, 0, [n, ...samples.flatMap((_, i) => [i + 1, 1, 1])], 4);
+
+  // stco: chunk offsets (one per sample since 1 sample per chunk)
+  const offsets = [];
+  let off = chunkOffset;
+  for (const s of samples) { offsets.push(off); off += s.size; }
+  const stco = buildFullBox("stco", 0, 0, [n, ...offsets], 4);
+
+  const parts = [...(stsdBytes ? [stsdBytes] : []), stts, ...(ctts ? [ctts] : []), ...(stss ? [stss] : []), stsz, stsc, stco];
+  const bodySize = parts.reduce((s, p) => s + p.byteLength, 0);
+  const stbl = new Uint8Array(8 + bodySize);
+  new DataView(stbl.buffer).setUint32(0, 8 + bodySize);
+  stbl.set([115,116,98,108], 4); // "stbl"
+  let pos = 8;
+  for (const p of parts) { stbl.set(p, pos); pos += p.byteLength; }
+  return stbl;
+}
+
+function buildFullBox(type, version, flags, values, bytesPerValue) {
+  const size = 12 + values.length * bytesPerValue;
+  const buf = new Uint8Array(size);
+  const v = new DataView(buf.buffer);
+  v.setUint32(0, size);
+  for (let i = 0; i < 4; i++) buf[4 + i] = type.charCodeAt(i);
+  buf[8] = version;
+  v.setUint32(8, (version << 24) | (flags & 0xFFFFFF));
+  let pos = 12;
+  for (const val of values) {
+    if (bytesPerValue === 4) v.setUint32(pos, val >>> 0);
+    else if (bytesPerValue === 8) { v.setUint32(pos, 0); v.setUint32(pos + 4, val >>> 0); }
+    pos += bytesPerValue;
+  }
+  return buf;
+}
+
+function patchMvhdDuration(moov, tracks) {
+  // Find mvhd in assembled moov bytes and patch duration
+  const view = new DataView(moov.buffer);
+  let pos = 8;
+  while (pos + 8 < moov.length) {
+    const size = view.getUint32(pos);
+    const type = String.fromCharCode(moov[pos+4], moov[pos+5], moov[pos+6], moov[pos+7]);
+    if (type === "mvhd") {
+      const version = moov[pos + 8];
+      const tsOff  = version === 1 ? pos + 20 : pos + 12;
+      const durOff = version === 1 ? pos + 28 : pos + 16;
+      const timescale = view.getUint32(tsOff);
+      // Sum all sample durations for track 0
+      const totalTicks = tracks[0]?.samples.reduce((s, x) => s + x.duration, 0) || 0;
+      // Convert to movie timescale (mvhd timescale is usually 1000 in mux.js output)
+      const trackTs = 90000;
+      const dur = Math.round(totalTicks * timescale / trackTs);
+      if (version === 0) view.setUint32(durOff, dur);
+      else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
+      break;
+    }
+    if (size < 8) break;
+    pos += size;
+  }
+}
 
 // ─── M3U8 parsing ─────────────────────────────────────────────────────────────
 

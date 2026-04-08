@@ -1,5 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
-console.log("[Altech Video Downloader] v1.1.3 — offscreen loaded | mux.js:", typeof muxjs);
+console.log("[Altech Video Downloader] v1.1.4 — offscreen loaded | mux.js:", typeof muxjs);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {
@@ -421,7 +421,7 @@ function rebuildMoov(src, moovBox, tracks, mdatSize) {
   const moovSize = 8 + moovBodySize;
 
   // moov starts right after ftyp (24 bytes)
-  const ftypSize = 24;
+  const ftypSize = 32; // buildFtyp() outputs 8 header + 4 major + 4 minor + 4×4 brands = 32
   const moovStartInFile = ftypSize;
   const mdatStartInFile = moovStartInFile + moovSize + 8; // +8 for mdat header... wait no
   // Actually: file = ftyp + moov + mdat

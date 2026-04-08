@@ -58,12 +58,16 @@ async function downloadHLS(m3u8Url, filename, tabId) {
     // ── Step 3: Remux TS → MP4, passing segments individually ─────────────────
     const mp4Bytes = await remuxTsToMp4(segmentBuffers);
 
-    // ── Step 4: Fix the duration in the moov/mvhd box ─────────────────────────
-    // USP/JWPlayer segments use large absolute PTS values; mux.js writes those
-    // into the MP4 timescale which players misinterpret as a huge duration.
-    // We overwrite it with the true duration parsed from #EXTINF tags.
+    // ── Step 4: Normalize timestamps (mirrors hls.js mp4-remuxer.ts approach) ──
+    // USP/JWPlayer segments carry large absolute PTS values. mux.js writes these
+    // into both tfdt.baseMediaDecodeTime (breaks seeking) and mvhd duration
+    // (shows ~27h). Two-step fix:
+    //   a) Read the initial PTS offset from the first moof/traf/tfdt box, then
+    //      subtract it from every tfdt → anchors timeline to 0 like hls.js's
+    //      resetTimeStamp() + timeOffset anchor in remuxVideo().
+    //   b) Overwrite mvhd/tkhd/mdhd with true duration from #EXTINF sum.
     if (totalDuration > 0) {
-      fixMp4Duration(mp4Bytes, totalDuration);
+      fixMp4Timestamps(mp4Bytes, totalDuration);
     }
 
     sendProgress(tabId, "done", 95, "Creating download…");
@@ -130,71 +134,133 @@ function remuxTsToMp4(segmentBuffers) {
   });
 }
 
-// ─── MP4 duration patcher ─────────────────────────────────────────────────────
-// Walks the top-level MP4 boxes to find moov, then patches mvhd + tkhd + mdhd
-// with the correct duration derived from the m3u8 #EXTINF sum.
+// ─── MP4 timestamp normalizer ─────────────────────────────────────────────────
+// Mirrors the hls.js mp4-remuxer.ts approach:
+//   1. Read the PTS anchor from the first moof/traf/tfdt (the absolute offset
+//      baked in by the USP broadcast timestamp).
+//   2. Subtract that anchor from every tfdt.baseMediaDecodeTime so the timeline
+//      starts at 0 — equivalent to hls.js resetTimeStamp() + timeOffset anchor.
+//   3. Patch mvhd/tkhd/mdhd duration with the true value from #EXTINF sum.
 
-function fixMp4Duration(bytes, totalSeconds) {
+function fixMp4Timestamps(bytes, totalSeconds) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
-  function readBox(offset) {
+  // ── Box reader ───────────────────────────────────────────────────────────────
+  function boxAt(offset) {
     if (offset + 8 > bytes.length) return null;
     let size = view.getUint32(offset);
-    const type = String.fromCharCode(bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7]);
-    if (size === 1) {
-      // 64-bit size
+    if (size === 1 && offset + 16 <= bytes.length) {
       size = view.getUint32(offset + 8) * 0x100000000 + view.getUint32(offset + 12);
     }
     if (size < 8 || offset + size > bytes.length) return null;
+    const type = String.fromCharCode(
+      bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7]
+    );
     return { type, offset, size };
   }
 
-  function patchDurationBox(boxOffset, boxType, timescale) {
-    const correctDuration = Math.round(totalSeconds * timescale);
-    const version = bytes[boxOffset + 8];
-    // version 0: timescale at +12 (4B), duration at +16 (4B)
-    // version 1: timescale at +20 (4B), duration at +24 (8B)
-    if (version === 0) {
-      view.setUint32(boxOffset + 16, correctDuration);
-    } else {
-      view.setUint32(boxOffset + 24, 0); // high 32 bits
-      view.setUint32(boxOffset + 28, correctDuration); // low 32 bits
-    }
-  }
-
-  function scanBoxes(start, end, depth) {
-    let offset = start;
-    while (offset < end) {
-      const box = readBox(offset);
+  // ── Walk boxes recursively ────────────────────────────────────────────────────
+  function walkBoxes(start, end, visitor) {
+    let pos = start;
+    while (pos < end) {
+      const box = boxAt(pos);
       if (!box) break;
-
-      if (box.type === "moov" || box.type === "trak" || box.type === "mdia") {
-        // Container — recurse into children
-        const childStart = box.type === "moov" ? offset + 8 : offset + 8;
-        scanBoxes(childStart, offset + box.size, depth + 1);
-      }
-
-      if (box.type === "mvhd" || box.type === "tkhd") {
-        // timescale position: v0 → offset+12, v1 → offset+20
-        const version = bytes[box.offset + 8];
-        const tsOff = version === 0 ? box.offset + 12 : box.offset + 20;
-        const timescale = view.getUint32(tsOff);
-        if (timescale > 0) patchDurationBox(box.offset, box.type, timescale);
-      }
-
-      if (box.type === "mdhd") {
-        // timescale position: v0 → offset+12, v1 → offset+20
-        const version = bytes[box.offset + 8];
-        const tsOff = version === 0 ? box.offset + 12 : box.offset + 20;
-        const timescale = view.getUint32(tsOff);
-        if (timescale > 0) patchDurationBox(box.offset, "mdhd", timescale);
-      }
-
-      offset += box.size;
+      visitor(box);
+      pos += box.size;
     }
   }
 
-  scanBoxes(0, bytes.length, 0);
+  // ── Step 1: Find the initial PTS offset from the first tfdt ──────────────────
+  // hls.js equivalent: the raw baseMediaDecodeTime before resetTimeStamp() anchor
+  let initPtsOffset = null;
+
+  function findFirstTfdt(start, end) {
+    walkBoxes(start, end, (box) => {
+      if (initPtsOffset !== null) return;
+      if (box.type === "moof") findFirstTfdt(box.offset + 8, box.offset + box.size);
+      if (box.type === "traf") findFirstTfdt(box.offset + 8, box.offset + box.size);
+      if (box.type === "tfdt") {
+        const version = bytes[box.offset + 8];
+        if (version === 1) {
+          initPtsOffset = view.getUint32(box.offset + 12) * 0x100000000
+                        + view.getUint32(box.offset + 16);
+        } else {
+          initPtsOffset = view.getUint32(box.offset + 12);
+        }
+      }
+    });
+  }
+  findFirstTfdt(0, bytes.length);
+
+  if (initPtsOffset === null || initPtsOffset === 0) {
+    // No offset to remove — just fix the duration fields
+    patchDurationFields(bytes, view, totalSeconds);
+    return;
+  }
+
+  // ── Step 2: Subtract initPtsOffset from every tfdt box ───────────────────────
+  // hls.js equivalent: baseMediaDecodeTime = rawDts - initDTS + timeOffset*timescale
+  // For a full VOD file starting at 0, timeOffset=0, so we just subtract initDTS.
+  function patchAllTfdt(start, end) {
+    walkBoxes(start, end, (box) => {
+      if (box.type === "moof") patchAllTfdt(box.offset + 8, box.offset + box.size);
+      if (box.type === "traf") patchAllTfdt(box.offset + 8, box.offset + box.size);
+      if (box.type === "tfdt") {
+        const version = bytes[box.offset + 8];
+        if (version === 1) {
+          const hi = view.getUint32(box.offset + 12);
+          const lo = view.getUint32(box.offset + 16);
+          const current = hi * 0x100000000 + lo;
+          const corrected = Math.max(0, current - initPtsOffset);
+          view.setUint32(box.offset + 12, Math.floor(corrected / 0x100000000));
+          view.setUint32(box.offset + 16, corrected >>> 0);
+        } else {
+          const current = view.getUint32(box.offset + 12);
+          view.setUint32(box.offset + 12, Math.max(0, current - initPtsOffset));
+        }
+      }
+    });
+  }
+  patchAllTfdt(0, bytes.length);
+
+  // ── Step 3: Patch moov duration fields with real #EXTINF total ───────────────
+  patchDurationFields(bytes, view, totalSeconds);
+}
+
+function patchDurationFields(bytes, view, totalSeconds) {
+  const CONTAINERS = new Set(["moov", "trak", "mdia"]);
+
+  function walkPatch(start, end) {
+    let pos = start;
+    while (pos < end) {
+      if (pos + 8 > bytes.length) break;
+      let size = view.getUint32(pos);
+      if (size === 1 && pos + 16 <= bytes.length)
+        size = view.getUint32(pos + 8) * 0x100000000 + view.getUint32(pos + 12);
+      if (size < 8 || pos + size > bytes.length) break;
+      const type = String.fromCharCode(bytes[pos+4], bytes[pos+5], bytes[pos+6], bytes[pos+7]);
+
+      if (CONTAINERS.has(type)) {
+        walkPatch(pos + 8, pos + size);
+      } else if (type === "mvhd" || type === "tkhd" || type === "mdhd") {
+        const version  = bytes[pos + 8];
+        const tsOffset = version === 0 ? pos + 12 : pos + 20;
+        const durOffset= version === 0 ? pos + 16 : pos + 24;
+        const timescale= view.getUint32(tsOffset);
+        if (timescale > 0) {
+          const correctDur = Math.round(totalSeconds * timescale);
+          if (version === 0) {
+            view.setUint32(durOffset, correctDur);
+          } else {
+            view.setUint32(durOffset,     0);          // high 32 bits
+            view.setUint32(durOffset + 4, correctDur); // low 32 bits
+          }
+        }
+      }
+      pos += size;
+    }
+  }
+  walkPatch(0, bytes.length);
 }
 
 // ─── M3U8 parsing ─────────────────────────────────────────────────────────────

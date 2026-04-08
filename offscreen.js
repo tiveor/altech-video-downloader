@@ -1,5 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
-console.log("[Altech Video Downloader] v1.1.6 — offscreen loaded | mux.js:", typeof muxjs);
+console.log("[Altech Video Downloader] v1.1.9 — offscreen loaded | mux.js:", typeof muxjs);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {
@@ -252,7 +252,7 @@ function defragmentFmp4(src, totalDurationSeconds) {
     const trackId = tkhdBox
       ? (version === 1 ? readU32(tkhdBox.dataOffset + 20) : readU32(tkhdBox.dataOffset + 12))
       : 0;
-    return { trak, trackId, samples: [], totalSize: 0 };
+    return { trak, trackId, samples: [], totalSize: 0, realTimescale: null };
   });
 
   const trackById = new Map(tracks.map(t => [t.trackId, t]));
@@ -323,7 +323,8 @@ function defragmentFmp4(src, totalDurationSeconds) {
 
       for (const trun of trunBoxes) {
         const trunOff = trun.dataOffset;
-        const trunFlags = readU32(trunOff) & 0xFFFFFF;
+        const trunVersion = readU8(trunOff);              // version byte (0 or 1)
+        const trunFlags   = readU32(trunOff) & 0xFFFFFF;
         let trunPos = trunOff + 4;
         const sampleCount = readU32(trunPos); trunPos += 4;
 
@@ -340,10 +341,17 @@ function defragmentFmp4(src, totalDurationSeconds) {
           const duration = (trunFlags & 0x100) ? readU32(trunPos) : defaultDuration; if (trunFlags & 0x100) trunPos += 4;
           const size     = (trunFlags & 0x200) ? readU32(trunPos) : defaultSize;     if (trunFlags & 0x200) trunPos += 4;
           const flags    = (trunFlags & 0x400) ? readU32(trunPos) : defaultFlags;    if (trunFlags & 0x400) trunPos += 4;
-          const cts      = (trunFlags & 0x800) ? view.getInt32(trunPos) : 0;         if (trunFlags & 0x800) trunPos += 4;
+          // ctts: signed (int32) for trun version=1, unsigned (uint32) for version=0
+          const cts = (trunFlags & 0x800)
+            ? (trunVersion === 1 ? view.getInt32(trunPos) : readU32(trunPos))
+            : 0;
+          if (trunFlags & 0x800) trunPos += 4;
 
-          track.samples.push({ duration, size, flags, cts, offset: samplePos });
-          track.totalSize += size;
+          // Skip zero-size samples (invalid; would cause stsc/stsz mismatch in VLC)
+          if (size > 0) {
+            track.samples.push({ duration, size, flags, cts, offset: samplePos });
+            track.totalSize += size;
+          }
           samplePos += size;
         }
       }
@@ -351,6 +359,24 @@ function defragmentFmp4(src, totalDurationSeconds) {
 
     mdatChunks.push(mdatPayload);
     mdatTotalSize += mdatPayload.byteLength;
+  }
+
+  // ── Derive real timescale per track from sample durations ──────────────────
+  // mux.js uses mdhd timescale=2 in fragmented mode, but trun sample durations
+  // are in the actual codec timescale (90000 for video, 44100 for audio).
+  // We derive the real timescale by matching total ticks to totalDuration.
+  for (const track of tracks) {
+    const totalTicks = track.samples.reduce((s, x) => s + x.duration, 0);
+    if (totalTicks > 0 && totalDurationSeconds > 0) {
+      const approx = totalTicks / totalDurationSeconds;
+      // Round to nearest standard timescale
+      const standards = [90000, 44100, 48000, 96000, 22050, 24000, 16000, 8000, 1000];
+      track.realTimescale = standards.reduce((best, ts) =>
+        Math.abs(ts - approx) < Math.abs(best - approx) ? ts : best
+      , standards[0]);
+    } else {
+      track.realTimescale = 90000;
+    }
   }
 
   // ── Rebuild moov without mvex, with stbl rebuilt for each trak ──────────────
@@ -407,7 +433,7 @@ function rebuildMoov(src, moovBox, tracks, mdatSize, totalDurationSeconds) {
   const moovEnd = moovBox.offset + moovBox.size;
   const moovChildren = childBoxesFrom(src, moovBox.dataOffset, moovEnd);
 
-  const rebuiltTraks = tracks.map(t => rebuildTrak(src, t, 0)); // stco placeholder
+  const rebuiltTraks = tracks.map(t => rebuildTrak(src, t, 0, t.realTimescale)); // stco placeholder
 
   // Compute total moov size
   let moovBodySize = 0;
@@ -430,7 +456,7 @@ function rebuildMoov(src, moovBox, tracks, mdatSize, totalDurationSeconds) {
   // mdatPayloadStart = position of first byte of mdat payload in the final file
   // ftyp(24) + moov(moovSize) + mdat_header(8)
   const mdatPayloadStart = ftypSize + moovSize + 8;
-  const rebuiltTraksFinal = tracks.map(t => rebuildTrak(src, t, mdatPayloadStart));
+  const rebuiltTraksFinal = tracks.map(t => rebuildTrak(src, t, mdatPayloadStart, t.realTimescale));
 
   // Assemble moov
   let bodySize = 0;
@@ -479,11 +505,11 @@ function childBoxesFrom(src, start, end) {
   return boxes;
 }
 
-function rebuildTrak(src, track, chunkOffset) {
-  // Copy trak as-is but rebuild the stbl inside minf/mdia
+function rebuildTrak(src, track, chunkOffset, realTimescale) {
+  // Copy trak as-is but rebuild the stbl inside minf/mdia,
+  // and replace mdhd with a corrected version using the real timescale.
   const trakBox = track.trak;
   const trakEnd = trakBox.offset + trakBox.size;
-  const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
 
   const mdiaBox = childBoxesFrom(src, trakBox.dataOffset, trakEnd).find(b => b.type === "mdia");
   if (!mdiaBox) return src.slice(trakBox.offset, trakBox.offset + trakBox.size);
@@ -496,12 +522,12 @@ function rebuildTrak(src, track, chunkOffset) {
   const stblBox = childBoxesFrom(src, minfBox.dataOffset, minfEnd).find(b => b.type === "stbl");
   if (!stblBox) return src.slice(trakBox.offset, trakBox.offset + trakBox.size);
 
-  // Get timescale from mdhd
-  const mdhdBox = childBoxesFrom(src, mdiaBox.dataOffset, mdiaEnd).find(b => b.type === "mdhd");
-  const mdhdVersion = mdhdBox ? src[mdhdBox.dataOffset] : 0;
-  const timescale = mdhdBox
-    ? (mdhdVersion === 1 ? view.getUint32(mdhdBox.dataOffset + 20) : view.getUint32(mdhdBox.dataOffset + 12))
-    : 90000;
+  // Use the derived real timescale (not the mux.js mdhd timescale which is 2)
+  const timescale = realTimescale || 90000;
+
+  // Build corrected mdhd: real timescale + exact duration from sample table
+  const totalTicks = track.samples.reduce((s, x) => s + x.duration, 0);
+  const newMdhd = buildMdhd(timescale, totalTicks);
 
   // Extract stsd from original stbl to carry over codec info
   const stsdBox = childBoxesFrom(src, stblBox.dataOffset, stblBox.offset + stblBox.size)
@@ -512,8 +538,11 @@ function rebuildTrak(src, track, chunkOffset) {
 
   // Rebuild minf: copy everything except old stbl, add new stbl
   const newMinf = rebuildContainer(src, minfBox, [{ type: "stbl", replace: newStbl }]);
-  // Rebuild mdia: copy everything except old minf, add new minf
-  const newMdia = rebuildContainer(src, mdiaBox, [{ type: "minf", replace: newMinf }]);
+  // Rebuild mdia: replace mdhd + minf
+  const newMdia = rebuildContainer(src, mdiaBox, [
+    { type: "mdhd", replace: newMdhd },
+    { type: "minf", replace: newMinf },
+  ]);
   // Rebuild trak: copy everything except old mdia, add new mdia
   const newTrak = rebuildContainer(src, trakBox, [{ type: "mdia", replace: newMdia }]);
 
@@ -545,6 +574,21 @@ function rebuildContainer(src, box, replacements) {
     }
   }
   return out;
+}
+
+function buildMdhd(timescale, totalTicks) {
+  // mdhd version 0: size(4)+type(4)+version+flags(4)+ctime(4)+mtime(4)+timescale(4)+duration(4)+lang(2)+pre(2) = 32 bytes
+  const buf = new Uint8Array(32);
+  const v = new DataView(buf.buffer);
+  v.setUint32(0, 32);
+  buf.set([109,100,104,100], 4); // "mdhd"
+  // version=0, flags=0 at byte 8 (already 0)
+  // creation_time=0, modification_time=0 (bytes 12, 16 already 0)
+  v.setUint32(20, timescale);
+  v.setUint32(24, Math.min(totalTicks, 0xFFFFFFFF) >>> 0);
+  v.setUint16(28, 0x55C4); // language "und"
+  // pre_defined=0 at byte 30 (already 0)
+  return buf;
 }
 
 function buildStbl(samples, chunkOffset, timescale, stsdBytes) {
@@ -589,8 +633,9 @@ function buildStbl(samples, chunkOffset, timescale, stsdBytes) {
   // stsz: sample sizes
   const stsz = buildFullBox("stsz", 0, 0, [0, n, ...samples.map(s => s.size)], 4);
 
-  // stsc: sample-to-chunk (1 sample per chunk)
-  const stsc = buildFullBox("stsc", 0, 0, [n, ...samples.flatMap((_, i) => [i + 1, 1, 1])], 4);
+  // stsc: compact form — 1 entry means "from chunk 1, every chunk has 1 sample"
+  // Equivalent to N entries [i+1, 1, 1] but avoids huge tables that crash VLC on seek
+  const stsc = buildFullBox("stsc", 0, 0, [1, 1, 1, 1], 4);
 
   // stco: absolute file offsets for each chunk (1 sample per chunk)
   // sample.offset is relative to start of combined mdat payload
@@ -650,10 +695,14 @@ function patchDurations(moov, totalDurationSeconds) {
         walk(pos + 8, pos + size);
       }
 
-      if (type === "mvhd" || type === "mdhd") {
+      // mdhd is rebuilt with correct timescale+duration in rebuildTrak() — skip it here
+      if (type === "mvhd") {
+        // FullBox layout: size(4)+type(4)+version(1)+flags(3)+ctime(4)+mtime(4)+timescale(4)+duration(4)
+        // version 0: timescale at pos+20, duration at pos+24
+        // version 1: ctime/mtime are uint64 so timescale at pos+28, duration at pos+32
         const version = moov[pos + 8];
-        const tsOff  = version === 1 ? pos + 20 : pos + 12;
-        const durOff = version === 1 ? pos + 28 : pos + 16;
+        const tsOff  = version === 1 ? pos + 28 : pos + 20;
+        const durOff = version === 1 ? pos + 32 : pos + 24;
         const ts = view.getUint32(tsOff);
         if (ts > 0) setDur(durOff, version, ts);
       }
@@ -682,7 +731,8 @@ function getMvhdTimescale(moov, view) {
     const type = String.fromCharCode(moov[pos+4], moov[pos+5], moov[pos+6], moov[pos+7]);
     if (type === "mvhd") {
       const version = moov[pos + 8];
-      return view.getUint32(version === 1 ? pos + 20 : pos + 12);
+      // version 0: timescale at pos+20 | version 1: timescale at pos+28
+      return view.getUint32(version === 1 ? pos + 28 : pos + 20);
     }
     pos += size;
   }

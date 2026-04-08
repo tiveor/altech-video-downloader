@@ -418,13 +418,10 @@ function rebuildMoov(src, moovBox, tracks, mdatSize) {
   // Actually: file = ftyp + moov + mdat
   // mdatPayloadStart = ftypSize + moovSize + 8
 
-  // Rebuild traks with correct stco offsets
-  let trackOffset = ftypSize + moovSize + 8; // start of mdat payload in file
-  const rebuiltTraksFinal = tracks.map(t => {
-    const trak = rebuildTrak(src, t, trackOffset);
-    trackOffset += t.totalSize;
-    return trak;
-  });
+  // mdatPayloadStart = position of first byte of mdat payload in the final file
+  // ftyp(24) + moov(moovSize) + mdat_header(8)
+  const mdatPayloadStart = ftypSize + moovSize + 8;
+  const rebuiltTraksFinal = tracks.map(t => rebuildTrak(src, t, mdatPayloadStart));
 
   // Assemble moov
   let bodySize = 0;
@@ -586,10 +583,10 @@ function buildStbl(samples, chunkOffset, timescale, stsdBytes) {
   // stsc: sample-to-chunk (1 sample per chunk)
   const stsc = buildFullBox("stsc", 0, 0, [n, ...samples.flatMap((_, i) => [i + 1, 1, 1])], 4);
 
-  // stco: chunk offsets (one per sample since 1 sample per chunk)
-  const offsets = [];
-  let off = chunkOffset;
-  for (const s of samples) { offsets.push(off); off += s.size; }
+  // stco: absolute file offsets for each chunk (1 sample per chunk)
+  // sample.offset is relative to start of combined mdat payload
+  // chunkOffset is the absolute file position of the mdat payload start
+  const offsets = samples.map(s => chunkOffset + s.offset);
   const stco = buildFullBox("stco", 0, 0, [n, ...offsets], 4);
 
   const parts = [...(stsdBytes ? [stsdBytes] : []), stts, ...(ctts ? [ctts] : []), ...(stss ? [stss] : []), stsz, stsc, stco];

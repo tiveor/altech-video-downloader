@@ -58,21 +58,23 @@ async function downloadHLS(m3u8Url, filename, tabId) {
     // segment to its playlist position instead of trusting raw TS timestamps.
     const mp4Bytes = await remuxTsToMp4(segmentBuffers, segmentDurations);
 
-    // ── Step 4: Fix moov duration (mvhd/tkhd/mdhd) with #EXTINF sum ──────────
-    if (totalDuration > 0) patchMoovDuration(mp4Bytes, totalDuration);
-
-    // ── Step 5: Defragment fMP4 → flat MP4 using mp4box.js ───────────────────
-    // mux.js outputs fragmented MP4 (moof+mdat per segment). Some players and
-    // editors struggle with fMP4. mp4box.js rebuilds it as a standard flat MP4
-    // with a complete sample table (stbl) inside moov — identical to what
-    // DownloadHelper produces via FFmpeg -c copy -movflags +faststart.
+    // ── Step 4: Defragment fMP4 → flat MP4 using toMp4.js ───────────────────
+    // mux.js outputs fragmented MP4 (moof+mdat per segment). toMp4.fromFmp4()
+    // reconstructs a standard flat MP4 with a full stbl sample table in moov,
+    // equivalent to: ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4
     sendProgress(tabId, "mux", 88, "Finalizing MP4…");
-    const flatMp4 = await defragmentMp4(mp4Bytes);
+    let finalBytes;
+    try {
+      finalBytes = toMp4.fromFmp4(mp4Bytes);
+    } catch (e) {
+      console.warn("[offscreen] toMp4 defrag failed, using fMP4:", e.message);
+      finalBytes = mp4Bytes; // fallback: still a valid (fragmented) MP4
+    }
 
     sendProgress(tabId, "done", 95, "Creating download…");
 
-    // ── Step 6: Download ──────────────────────────────────────────────────────
-    const blob    = new Blob([flatMp4], { type: "video/mp4" });
+    // ── Step 5: Download ──────────────────────────────────────────────────────
+    const blob    = new Blob([finalBytes], { type: "video/mp4" });
     const blobUrl = URL.createObjectURL(blob);
     chrome.runtime.sendMessage({
       type: "HLS_BLOB_READY",
@@ -178,96 +180,6 @@ function transmuxOneSegment(tsData, baseMediaDecodeTime) {
   });
 }
 
-// ─── Moov duration patcher ────────────────────────────────────────────────────
-// Patches mvhd, tkhd, and mdhd duration fields with the true total duration
-// derived from the sum of #EXTINF values. The timescale for each box is read
-// from the box itself so audio (e.g. 44100 Hz) and video (90000 Hz) are handled
-// independently without scale mismatch.
-
-function patchMoovDuration(bytes, totalSeconds) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const CONTAINERS = new Set(["moov", "trak", "mdia"]);
-
-  let pos = 0;
-  while (pos < bytes.length - 8) {
-    let size = view.getUint32(pos);
-    if (size === 1 && pos + 16 <= bytes.length)
-      size = view.getUint32(pos + 8) * 0x100000000 + view.getUint32(pos + 12);
-    if (size < 8 || pos + size > bytes.length) break;
-    const type = String.fromCharCode(bytes[pos+4], bytes[pos+5], bytes[pos+6], bytes[pos+7]);
-
-    if (CONTAINERS.has(type)) {
-      patchMoovDuration_inner(bytes, view, pos + 8, pos + size, totalSeconds);
-    }
-    pos += size;
-  }
-}
-
-function patchMoovDuration_inner(bytes, view, start, end, totalSeconds) {
-  let pos = start;
-  while (pos < end - 8) {
-    let size = view.getUint32(pos);
-    if (size === 1 && pos + 16 <= bytes.length)
-      size = view.getUint32(pos + 8) * 0x100000000 + view.getUint32(pos + 12);
-    if (size < 8 || pos + size > end) break;
-    const type = String.fromCharCode(bytes[pos+4], bytes[pos+5], bytes[pos+6], bytes[pos+7]);
-
-    if (type === "moov" || type === "trak" || type === "mdia") {
-      patchMoovDuration_inner(bytes, view, pos + 8, pos + size, totalSeconds);
-    } else if (type === "mvhd" || type === "tkhd" || type === "mdhd") {
-      const version  = bytes[pos + 8];
-      const tsOffset = version === 0 ? pos + 12 : pos + 20;
-      const durOffset= version === 0 ? pos + 16 : pos + 24;
-      const timescale = view.getUint32(tsOffset);
-      if (timescale > 0) {
-        const dur = Math.round(totalSeconds * timescale);
-        if (version === 0) {
-          view.setUint32(durOffset, dur);
-        } else {
-          view.setUint32(durOffset,     Math.floor(dur / 0x100000000));
-          view.setUint32(durOffset + 4, dur >>> 0);
-        }
-      }
-    }
-    pos += size;
-  }
-}
-
-// ─── fMP4 → flat MP4 defragmentation via mp4box.js ───────────────────────────
-// mp4box.js write() requires its own DataStream object — not a custom stream.
-// We use MP4Box.DataStream (BIG_ENDIAN) and read its buffer after write().
-
-function defragmentMp4(fragmentedBytes) {
-  try {
-    const mp4boxFile = MP4Box.createFile(false);
-
-    mp4boxFile.onError = (e) => { throw new Error("mp4box: " + e); };
-
-    // Feed the fragmented bytes — fileStart must be set on the ArrayBuffer
-    const inputBuffer = fragmentedBytes.buffer.slice(
-      fragmentedBytes.byteOffset,
-      fragmentedBytes.byteOffset + fragmentedBytes.byteLength
-    );
-    inputBuffer.fileStart = 0;
-    mp4boxFile.appendBuffer(inputBuffer);
-    mp4boxFile.flush();
-
-    // Write out as flat (non-fragmented) MP4 using mp4box's DataStream
-    const ds = new MP4Box.DataStream(undefined, 0, MP4Box.DataStream.BIG_ENDIAN);
-    mp4boxFile.write(ds);
-
-    const out = new Uint8Array(ds.buffer);
-    if (out.byteLength < 16) {
-      console.warn("[offscreen] mp4box produced empty output, using fMP4");
-      return Promise.resolve(fragmentedBytes);
-    }
-    return Promise.resolve(out);
-
-  } catch (err) {
-    console.warn("[offscreen] defragment failed, using fMP4:", err.message);
-    return Promise.resolve(fragmentedBytes);
-  }
-}
 
 // ─── M3U8 parsing ─────────────────────────────────────────────────────────────
 

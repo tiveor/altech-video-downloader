@@ -162,6 +162,41 @@ header {
 .badge.dom     { background: #1a2a3a; color: #42a5f5; }
 .badge.link    { background: #2a1a3a; color: #ab47bc; }
 .badge.meta    { background: #3a2a1a; color: #ffa726; }
+.badge.hls     { background: #1a2a1a; color: #69f0ae; }
+.badge.ts      { background: #2a1a2a; color: #ce93d8; }
+.badge.direct  { background: #1a2a3a; color: #42a5f5; }
+
+.video-icon.hls {
+  background: #1a2a1a;
+}
+.video-icon.hls svg {
+  stroke: #69f0ae;
+}
+
+.progress-wrap {
+  margin-top: 5px;
+}
+
+.progress-bar {
+  height: 4px;
+  background: #0f3460;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #e94560, #ff7043);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+  width: 0%;
+}
+
+.progress-label {
+  font-size: 10px;
+  color: #7ec8e3;
+  margin-top: 2px;
+}
 
 .download-btn {
   flex-shrink: 0;

@@ -8,7 +8,8 @@
     "scripting",
     "downloads",
     "webRequest",
-    "storage"
+    "storage",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"

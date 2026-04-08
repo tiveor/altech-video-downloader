@@ -1,4 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
+console.log("[offscreen] loaded — mux.js:", typeof muxjs, "| toMp4:", typeof toMp4, toMp4?.version);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {

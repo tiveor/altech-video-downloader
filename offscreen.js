@@ -1,5 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
-console.log("[Altech Video Downloader] v1.1.9 — offscreen loaded | mux.js:", typeof muxjs);
+console.log("[Altech Video Downloader] v1.2.0 — offscreen loaded | mux.js:", typeof muxjs);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {

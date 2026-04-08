@@ -1,5 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
-console.log("[Altech Video Downloader] v1.1.4 — offscreen loaded | mux.js:", typeof muxjs);
+console.log("[Altech Video Downloader] v1.1.5 — offscreen loaded | mux.js:", typeof muxjs);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {
@@ -66,7 +66,7 @@ async function downloadHLS(m3u8Url, filename, tabId) {
     sendProgress(tabId, "mux", 88, "Finalizing MP4…");
     let finalBytes;
     try {
-      finalBytes = defragmentFmp4(mp4Bytes);
+      finalBytes = defragmentFmp4(mp4Bytes, totalDuration);
     } catch (e) {
       console.warn("[offscreen] defrag failed, using fMP4:", e.message);
       finalBytes = mp4Bytes;
@@ -189,7 +189,7 @@ function transmuxOneSegment(tsData, baseMediaDecodeTime) {
 // payload bytes, rebuild stbl boxes in each trak, strip mvex, and write a
 // single flat file: ftyp + moov + mdat.
 
-function defragmentFmp4(src) {
+function defragmentFmp4(src, totalDurationSeconds) {
   const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
 
   // ── Box reader ──────────────────────────────────────────────────────────────
@@ -354,7 +354,7 @@ function defragmentFmp4(src) {
   }
 
   // ── Rebuild moov without mvex, with stbl rebuilt for each trak ──────────────
-  const newMoov = rebuildMoov(src, moovBox, tracks, mdatTotalSize);
+  const newMoov = rebuildMoov(src, moovBox, tracks, mdatTotalSize, totalDurationSeconds);
 
   // ── Assemble: ftyp + moov + mdat ────────────────────────────────────────────
   const ftypBytes = ftypBox ? src.slice(ftypBox.offset, ftypBox.offset + ftypBox.size) : new Uint8Array(0);
@@ -393,7 +393,7 @@ function buildFtyp() {
   return buf;
 }
 
-function rebuildMoov(src, moovBox, tracks, mdatSize) {
+function rebuildMoov(src, moovBox, tracks, mdatSize, totalDurationSeconds) {
   // We'll reconstruct moov by copying everything except mvex,
   // and replacing each trak's minf/stbl with rebuilt sample tables.
   // The chunk offset (stco) for each track points into the single mdat.
@@ -458,7 +458,7 @@ function rebuildMoov(src, moovBox, tracks, mdatSize) {
 
   // Patch mvhd duration: use track[0] total duration in movie timescale
   // Find mvhd in moov and patch duration
-  patchMvhdDuration(moov, tracks);
+  patchDurations(moov, totalDurationSeconds);
 
   return moov;
 }
@@ -625,30 +625,65 @@ function buildFullBox(type, version, flags, values, bytesPerValue) {
   return buf;
 }
 
-function patchMvhdDuration(moov, tracks) {
-  // Find mvhd in assembled moov bytes and patch duration
+function patchDurations(moov, totalDurationSeconds) {
+  // Walk the assembled moov bytes and patch duration in mvhd, tkhd, mdhd.
+  // Each box has its own timescale, so we scale totalDurationSeconds by it.
   const view = new DataView(moov.buffer);
+
+  function walk(start, end) {
+    let pos = start;
+    while (pos + 8 <= end) {
+      const size = view.getUint32(pos);
+      if (size < 8 || pos + size > end) break;
+      const type = String.fromCharCode(moov[pos+4], moov[pos+5], moov[pos+6], moov[pos+7]);
+
+      if (type === "trak" || type === "mdia" || type === "minf" || type === "stbl") {
+        walk(pos + 8, pos + size);
+      }
+
+      if (type === "mvhd" || type === "mdhd") {
+        const version = moov[pos + 8];
+        const tsOff  = version === 1 ? pos + 20 : pos + 12;
+        const durOff = version === 1 ? pos + 28 : pos + 16;
+        const timescale = view.getUint32(tsOff);
+        if (timescale > 0 && totalDurationSeconds > 0) {
+          const dur = Math.round(totalDurationSeconds * timescale);
+          if (version === 0) view.setUint32(durOff, dur);
+          else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
+        }
+      }
+
+      if (type === "tkhd") {
+        // tkhd layout (version 0): flags(3)+v(1) | creation(4) | modification(4) | track_id(4) | reserved(4) | duration(4)
+        const version = moov[pos + 8];
+        const durOff = version === 1 ? pos + 36 : pos + 28;
+        const mvhdTimescale = getMvhdTimescale(moov, view);
+        if (mvhdTimescale > 0 && totalDurationSeconds > 0) {
+          const dur = Math.round(totalDurationSeconds * mvhdTimescale);
+          if (version === 0) view.setUint32(durOff, dur);
+          else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
+        }
+      }
+
+      pos += size;
+    }
+  }
+  walk(8, moov.length);
+}
+
+function getMvhdTimescale(moov, view) {
   let pos = 8;
-  while (pos + 8 < moov.length) {
+  while (pos + 8 <= moov.length) {
     const size = view.getUint32(pos);
+    if (size < 8) break;
     const type = String.fromCharCode(moov[pos+4], moov[pos+5], moov[pos+6], moov[pos+7]);
     if (type === "mvhd") {
       const version = moov[pos + 8];
-      const tsOff  = version === 1 ? pos + 20 : pos + 12;
-      const durOff = version === 1 ? pos + 28 : pos + 16;
-      const timescale = view.getUint32(tsOff);
-      // Sum all sample durations for track 0
-      const totalTicks = tracks[0]?.samples.reduce((s, x) => s + x.duration, 0) || 0;
-      // Convert to movie timescale (mvhd timescale is usually 1000 in mux.js output)
-      const trackTs = 90000;
-      const dur = Math.round(totalTicks * timescale / trackTs);
-      if (version === 0) view.setUint32(durOff, dur);
-      else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
-      break;
+      return view.getUint32(version === 1 ? pos + 20 : pos + 12);
     }
-    if (size < 8) break;
     pos += size;
   }
+  return 1000;
 }
 
 // ─── M3U8 parsing ─────────────────────────────────────────────────────────────

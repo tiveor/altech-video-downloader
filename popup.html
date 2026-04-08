@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Altech Video Downloader</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polygon points="5 3 19 12 5 21 5 3"/>
+      </svg>
+      <span>Video Downloader</span>
+    </div>
+    <button id="scan-btn" title="Scan page for videos">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      Scan
+    </button>
+  </header>
+
+  <div id="status" class="status hidden"></div>
+
+  <div id="video-list"></div>
+
+  <div id="empty" class="empty hidden">
+    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <rect x="2" y="6" width="20" height="14" rx="2"/>
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+      <line x1="12" y1="11" x2="12" y2="15"/><line x1="10" y1="13" x2="14" y2="13"/>
+    </svg>
+    <p>No videos detected yet.</p>
+    <p class="hint">Play a video or click <strong>Scan</strong> to search the page.</p>
+  </div>
+
+  <footer>
+    <span id="count">0 videos found</span>
+    <button id="clear-btn">Clear</button>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

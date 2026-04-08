@@ -59,14 +59,20 @@ async function downloadHLS(m3u8Url, filename, tabId) {
     const mp4Bytes = await remuxTsToMp4(segmentBuffers, segmentDurations);
 
     // ── Step 4: Fix moov duration (mvhd/tkhd/mdhd) with #EXTINF sum ──────────
-    // The per-segment transmuxers write the correct tfdt values, but the moov box
-    // duration field still reflects only the last segment. Patch it with the total.
     if (totalDuration > 0) patchMoovDuration(mp4Bytes, totalDuration);
+
+    // ── Step 5: Defragment fMP4 → flat MP4 using mp4box.js ───────────────────
+    // mux.js outputs fragmented MP4 (moof+mdat per segment). Some players and
+    // editors struggle with fMP4. mp4box.js rebuilds it as a standard flat MP4
+    // with a complete sample table (stbl) inside moov — identical to what
+    // DownloadHelper produces via FFmpeg -c copy -movflags +faststart.
+    sendProgress(tabId, "mux", 88, "Finalizing MP4…");
+    const flatMp4 = await defragmentMp4(mp4Bytes);
 
     sendProgress(tabId, "done", 95, "Creating download…");
 
-    // ── Step 5: Download ──────────────────────────────────────────────────────
-    const blob    = new Blob([mp4Bytes], { type: "video/mp4" });
+    // ── Step 6: Download ──────────────────────────────────────────────────────
+    const blob    = new Blob([flatMp4], { type: "video/mp4" });
     const blobUrl = URL.createObjectURL(blob);
     chrome.runtime.sendMessage({
       type: "HLS_BLOB_READY",
@@ -225,6 +231,74 @@ function patchMoovDuration_inner(bytes, view, start, end, totalSeconds) {
     }
     pos += size;
   }
+}
+
+// ─── fMP4 → flat MP4 defragmentation via mp4box.js ───────────────────────────
+// Converts the fragmented MP4 output of mux.js into a standard flat MP4 with a
+// full sample table (stbl), which all players and editors handle correctly.
+
+function defragmentMp4(fragmentedBytes) {
+  return new Promise((resolve, reject) => {
+    try {
+      const mp4boxFile = MP4Box.createFile(false); // false = do not keep data refs
+
+      let flatBuffer = null;
+
+      mp4boxFile.onReady = (info) => {
+        // Set each track to be extracted as a single non-segmented run
+        for (const track of info.tracks) {
+          mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: Infinity });
+        }
+        mp4boxFile.start();
+      };
+
+      mp4boxFile.onSegment = (id, user, buffer) => {
+        // mp4box.js calls this with the rebuilt flat track data — we only need
+        // the first call per track; the real output comes from writeFile below.
+      };
+
+      mp4boxFile.onError = (e) => reject(new Error("mp4box error: " + e));
+
+      // Feed the fragmented buffer — mp4box.js needs an ArrayBuffer with a
+      // fileStart property indicating the byte offset in the file.
+      const inputBuffer = fragmentedBytes.buffer.slice(
+        fragmentedBytes.byteOffset,
+        fragmentedBytes.byteOffset + fragmentedBytes.byteLength
+      );
+      inputBuffer.fileStart = 0;
+      mp4boxFile.appendBuffer(inputBuffer);
+      mp4boxFile.flush();
+
+      // Write back as a flat (non-fragmented) MP4
+      const outputStream = {
+        buffers:  [],
+        write(buffer) { this.buffers.push(buffer); },
+      };
+
+      mp4boxFile.write(outputStream);
+
+      if (outputStream.buffers.length === 0) {
+        // mp4box.js write() produced nothing — return original (better than nothing)
+        console.warn("[offscreen] mp4box defragment produced no output, using fMP4");
+        resolve(fragmentedBytes);
+        return;
+      }
+
+      // Merge all output chunks into one Uint8Array
+      const totalLen = outputStream.buffers.reduce((s, b) => s + b.byteLength, 0);
+      const out = new Uint8Array(totalLen);
+      let pos = 0;
+      for (const buf of outputStream.buffers) {
+        out.set(new Uint8Array(buf), pos);
+        pos += buf.byteLength;
+      }
+      resolve(out);
+
+    } catch (err) {
+      console.warn("[offscreen] defragment failed, using fMP4:", err);
+      resolve(fragmentedBytes); // fallback — still a valid (fragmented) MP4
+    }
+  });
 }
 
 // ─── M3U8 parsing ─────────────────────────────────────────────────────────────

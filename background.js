@@ -47,6 +47,10 @@ function ensureTab(tabId) {
   if (!tabVideos[tabId]) tabVideos[tabId] = {};
 }
 
+// knownVariants[tabId] = Set of variant m3u8 URLs that belong to a master.
+// These should not appear as standalone entries.
+const knownVariants = {};
+
 function updateBadge(tabId) {
   const count = Object.keys(tabVideos[tabId] || {}).length;
   chrome.action.setBadgeText({ text: count > 0 ? String(count) : "", tabId });
@@ -92,34 +96,43 @@ chrome.webRequest.onResponseStarted.addListener(
     const pathname = new URL(details.url).pathname;
 
     if (kind === "hls") {
+      const tabId   = details.tabId;
+      const url     = details.url;
       const filename = pathname.split("/").pop().replace(/\.m3u8.*/, "") || "stream";
-      addEntry(details.tabId, {
-        key:     details.url,
-        type:    "hls",
-        m3u8Url: details.url,
-        filename,
-        label:   filename,
-        contentType,
-        segmentCount: 0,
+
+      // If already known to be a variant of a master, skip it
+      if (knownVariants[tabId]?.has(url)) return;
+
+      // Add optimistically, then classify async
+      addEntry(tabId, {
+        key: url, type: "hls", m3u8Url: url,
+        filename, label: filename, contentType, segmentCount: 0,
       });
+
+      // Fetch the m3u8 asynchronously to check master vs variant
+      classifyM3u8(tabId, url);
     }
 
     if (kind === "ts-segment") {
+      const tabId   = details.tabId;
       const baseKey = tsStreamKey(details.url);
-      // Infer the likely m3u8 URL (same base + .m3u8, same origin)
       const m3u8Inferred = baseKey + ".m3u8";
-      const filename = baseKey.split("/").pop() || "stream";
+      const filename     = baseKey.split("/").pop() || "stream";
 
-      addEntry(details.tabId, {
-        key:          baseKey,
-        type:         "ts-segment",
-        m3u8Url:      m3u8Inferred, // may be confirmed later when actual m3u8 is seen
-        filename,
-        label:        filename,
-        contentType:  "video/MP2T",
-        segmentCount: 1,
-        baseSegmentUrl: baseKey, // prefix for fetching segments
-      });
+      // Only add ts-segment group if there's no m3u8 entry already covering it
+      if (!tabVideos[tabId]?.[m3u8Inferred]) {
+        addEntry(tabId, {
+          key: baseKey, type: "ts-segment",
+          m3u8Url: m3u8Inferred,
+          filename, label: filename,
+          contentType: "video/MP2T",
+          segmentCount: 1,
+        });
+      } else {
+        // Just bump segment count on the existing m3u8 entry
+        const existing = tabVideos[tabId][m3u8Inferred];
+        if (existing) existing.segmentCount = (existing.segmentCount || 0) + 1;
+      }
     }
 
     if (kind === "direct") {
@@ -139,13 +152,69 @@ chrome.webRequest.onResponseStarted.addListener(
   ["responseHeaders"]
 );
 
+// ─── Async m3u8 classification ────────────────────────────────────────────────
+// Fetches the m3u8 to determine if it's a master playlist.
+// If it IS a master: parses variant URLs and removes them from the entry list.
+// If it IS a variant already known: removes itself from the entry list.
+// This ensures only one entry per stream (the master) is shown.
+
+async function classifyM3u8(tabId, url) {
+  try {
+    const res  = await fetch(url);
+    const text = await res.text();
+    const isMaster = text.includes("#EXT-X-STREAM-INF");
+
+    if (isMaster) {
+      const baseDir  = url.substring(0, url.lastIndexOf("/") + 1);
+      const lines    = text.split("\n").map((l) => l.trim());
+
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
+        const uri = lines[i + 1];
+        if (!uri || uri.startsWith("#")) continue;
+        const variantUrl = /^https?:\/\//i.test(uri) ? uri : new URL(uri, url).href;
+
+        // Register as known variant
+        if (!knownVariants[tabId]) knownVariants[tabId] = new Set();
+        knownVariants[tabId].add(variantUrl);
+
+        // Remove variant entry if already added
+        if (tabVideos[tabId]?.[variantUrl]) {
+          delete tabVideos[tabId][variantUrl];
+        }
+
+        // Remove ts-segment group entry whose inferred m3u8 matches this variant
+        for (const [key, entry] of Object.entries(tabVideos[tabId] || {})) {
+          if (entry.type === "ts-segment" && entry.m3u8Url === variantUrl) {
+            delete tabVideos[tabId][key];
+          }
+        }
+      }
+      updateBadge(tabId);
+
+    } else {
+      // This is a variant — if we already know the master, remove this entry
+      if (knownVariants[tabId]?.has(url) && tabVideos[tabId]?.[url]) {
+        delete tabVideos[tabId][url];
+        updateBadge(tabId);
+      }
+    }
+  } catch {
+    // If fetch fails (CORS, network error) just leave the entry as-is
+  }
+}
+
 // ─── Tab lifecycle ────────────────────────────────────────────────────────────
 
-chrome.tabs.onRemoved.addListener((tabId) => { delete tabVideos[tabId]; });
+chrome.tabs.onRemoved.addListener((tabId) => {
+  delete tabVideos[tabId];
+  delete knownVariants[tabId];
+});
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" && changeInfo.url) {
     delete tabVideos[tabId];
+    delete knownVariants[tabId];
     chrome.action.setBadgeText({ text: "", tabId });
   }
 });

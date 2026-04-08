@@ -1,5 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
-console.log("[Altech Video Downloader] v1.1.5 — offscreen loaded | mux.js:", typeof muxjs);
+console.log("[Altech Video Downloader] v1.1.6 — offscreen loaded | mux.js:", typeof muxjs);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {
@@ -626,18 +626,27 @@ function buildFullBox(type, version, flags, values, bytesPerValue) {
 }
 
 function patchDurations(moov, totalDurationSeconds) {
-  // Walk the assembled moov bytes and patch duration in mvhd, tkhd, mdhd.
-  // Each box has its own timescale, so we scale totalDurationSeconds by it.
+  if (!totalDurationSeconds) return;
   const view = new DataView(moov.buffer);
+
+  // First pass: find mvhd timescale (needed for tkhd)
+  const mvhdTs = getMvhdTimescale(moov, view);
+
+  function setDur(durOff, version, timescale) {
+    const dur = Math.round(totalDurationSeconds * timescale);
+    if (version === 0) view.setUint32(durOff, dur);
+    else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
+  }
 
   function walk(start, end) {
     let pos = start;
     while (pos + 8 <= end) {
       const size = view.getUint32(pos);
-      if (size < 8 || pos + size > end) break;
+      if (size < 8 || pos + size > moov.length) break;
       const type = String.fromCharCode(moov[pos+4], moov[pos+5], moov[pos+6], moov[pos+7]);
 
-      if (type === "trak" || type === "mdia" || type === "minf" || type === "stbl") {
+      // Recurse into containers
+      if (type === "trak" || type === "mdia" || type === "minf") {
         walk(pos + 8, pos + size);
       }
 
@@ -645,37 +654,31 @@ function patchDurations(moov, totalDurationSeconds) {
         const version = moov[pos + 8];
         const tsOff  = version === 1 ? pos + 20 : pos + 12;
         const durOff = version === 1 ? pos + 28 : pos + 16;
-        const timescale = view.getUint32(tsOff);
-        if (timescale > 0 && totalDurationSeconds > 0) {
-          const dur = Math.round(totalDurationSeconds * timescale);
-          if (version === 0) view.setUint32(durOff, dur);
-          else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
-        }
+        const ts = view.getUint32(tsOff);
+        if (ts > 0) setDur(durOff, version, ts);
       }
 
       if (type === "tkhd") {
-        // tkhd layout (version 0): flags(3)+v(1) | creation(4) | modification(4) | track_id(4) | reserved(4) | duration(4)
+        // tkhd v0: size(4)+type(4)+v(1)+flags(3)+ctime(4)+mtime(4)+trackid(4)+reserved(4)+duration(4)
+        // tkhd v1: size(4)+type(4)+v(1)+flags(3)+ctime(8)+mtime(8)+trackid(4)+reserved(4)+duration(8)
         const version = moov[pos + 8];
         const durOff = version === 1 ? pos + 36 : pos + 28;
-        const mvhdTimescale = getMvhdTimescale(moov, view);
-        if (mvhdTimescale > 0 && totalDurationSeconds > 0) {
-          const dur = Math.round(totalDurationSeconds * mvhdTimescale);
-          if (version === 0) view.setUint32(durOff, dur);
-          else { view.setUint32(durOff, 0); view.setUint32(durOff + 4, dur); }
-        }
+        if (mvhdTs > 0) setDur(durOff, version, mvhdTs);
       }
 
       pos += size;
     }
   }
+
   walk(8, moov.length);
 }
 
 function getMvhdTimescale(moov, view) {
+  // Scan only top-level moov children (mvhd is always a direct child)
   let pos = 8;
   while (pos + 8 <= moov.length) {
     const size = view.getUint32(pos);
-    if (size < 8) break;
+    if (size < 8 || pos + size > moov.length) break;
     const type = String.fromCharCode(moov[pos+4], moov[pos+5], moov[pos+6], moov[pos+7]);
     if (type === "mvhd") {
       const version = moov[pos + 8];
@@ -683,7 +686,7 @@ function getMvhdTimescale(moov, view) {
     }
     pos += size;
   }
-  return 1000;
+  return 1;
 }
 
 // ─── M3U8 parsing ─────────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 // Offscreen document: fetches HLS segments and muxes them to MP4 using mux.js
-console.log("[Altech Video Downloader] v1.1.1 — offscreen loaded | mux.js:", typeof muxjs);
+console.log("[Altech Video Downloader] v1.1.2 — offscreen loaded | mux.js:", typeof muxjs);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_DOWNLOAD_HLS") {
@@ -312,9 +312,14 @@ function defragmentFmp4(src) {
       const track = trackById.get(trackId);
       if (!track) continue;
 
-      // Parse trun boxes
+      // Parse trun boxes.
+      // Per ISO 14496-12: trun data_offset is relative to the "base data offset".
+      // When tfhd flag 0x1 (base-data-offset-present) is NOT set, the base is
+      // the start of the enclosing moof box. mux.js uses this form.
+      // So: absolute file position = moof.offset + trun.data_offset + per-sample-accumulator
+      // We store offset relative to the combined mdat payload:
+      //   offset_in_combined_mdat = (moof.offset + trun.data_offset) - mdat.offset - 8 + mdatPayloadOffset
       const trunBoxes = childBoxes(traf.dataOffset, trafEnd).filter(b => b.type === "trun");
-      let dataOffset = 0; // relative to mdat start
 
       for (const trun of trunBoxes) {
         const trunOff = trun.dataOffset;
@@ -322,8 +327,14 @@ function defragmentFmp4(src) {
         let trunPos = trunOff + 4;
         const sampleCount = readU32(trunPos); trunPos += 4;
 
-        if (trunFlags & 0x001) { dataOffset = view.getInt32(trunPos); trunPos += 4; }
+        // data_offset is relative to moof start (base-data-offset = moof.offset)
+        let trunDataOffset = 0;
+        if (trunFlags & 0x001) { trunDataOffset = view.getInt32(trunPos); trunPos += 4; }
         if (trunFlags & 0x004) { trunPos += 4; } // first_sample_flags
+
+        // Convert: absolute position in fMP4 = moof.offset + trunDataOffset
+        // Position in combined mdat payload = that absolute pos - mdat.offset - 8 + mdatPayloadOffset
+        let samplePos = mdatPayloadOffset + (moof.offset + trunDataOffset) - mdat.offset - 8;
 
         for (let s = 0; s < sampleCount; s++) {
           const duration = (trunFlags & 0x100) ? readU32(trunPos) : defaultDuration; if (trunFlags & 0x100) trunPos += 4;
@@ -331,11 +342,9 @@ function defragmentFmp4(src) {
           const flags    = (trunFlags & 0x400) ? readU32(trunPos) : defaultFlags;    if (trunFlags & 0x400) trunPos += 4;
           const cts      = (trunFlags & 0x800) ? view.getInt32(trunPos) : 0;         if (trunFlags & 0x800) trunPos += 4;
 
-          const sampleFileOffset = mdatPayloadOffset + dataOffset;
-          dataOffset += size;
-
-          track.samples.push({ duration, size, flags, cts, offset: sampleFileOffset });
+          track.samples.push({ duration, size, flags, cts, offset: samplePos });
           track.totalSize += size;
+          samplePos += size;
         }
       }
     }

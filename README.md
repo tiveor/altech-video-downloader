@@ -56,16 +56,25 @@ A Chrome extension that detects and downloads videos from web pages, with full s
 
 ## Installation
 
-### From source (developer mode)
+### Quick install (no coding required)
+
+1. [**Download the latest release**](https://github.com/tiveor/altech-video-downloader/releases/latest) — grab the `.zip` file
+2. **Unzip** the downloaded file
+3. Open Chrome and go to `chrome://extensions/`
+4. Enable **Developer mode** (toggle in the top-right corner)
+5. Click **Load unpacked** and select the unzipped folder
+6. Done — the extension icon will appear in your toolbar
+
+> **Tip:** You can pin the extension by clicking the puzzle icon in the toolbar and selecting the pin next to Altech Video Downloader.
+
+### From source
 
 1. Clone this repository:
    ```bash
    git clone https://github.com/tiveor/altech-video-downloader.git
    ```
-2. Open Chrome and navigate to `chrome://extensions/`
-3. Enable **Developer mode** (toggle in the top-right corner)
-4. Click **Load unpacked** and select the cloned folder
-5. The extension icon will appear in your toolbar
+2. Open Chrome → `chrome://extensions/` → Enable **Developer mode**
+3. Click **Load unpacked** and select the cloned folder
 
 ### Build for distribution
 

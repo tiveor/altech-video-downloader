@@ -2,6 +2,18 @@
 
 All notable changes to Altech Video Downloader will be documented in this file.
 
+## [1.2.1] - 2026-04-09
+
+### Changed
+- Moved `<all_urls>` from required `host_permissions` to `optional_host_permissions` for faster Chrome Web Store review
+- Network interception now activates only after user grants permission via popup banner
+- Extension still works without host permission using manual Scan + DOM detection
+
+### Added
+- Permission request banner in popup for first-time users
+- `PRIVACY.md` privacy policy
+- `CHANGELOG.md`
+
 ## [1.2.0] - 2026-04-08
 
 ### Changed
@@ -56,6 +68,7 @@ All notable changes to Altech Video Downloader will be documented in this file.
 - Dynamic detection via MutationObserver
 - Dark-themed popup UI with badge counter
 
+[1.2.1]: https://github.com/tiveor/altech-video-downloader/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/tiveor/altech-video-downloader/compare/v1.1.3...v1.2.0
 [1.1.3]: https://github.com/tiveor/altech-video-downloader/compare/v1.1.1...v1.1.3
 [1.1.1]: https://github.com/tiveor/altech-video-downloader/compare/v1.1.0...v1.1.1

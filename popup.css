@@ -279,3 +279,30 @@ footer {
   border-color: #00BCD4;
   color: #00BCD4;
 }
+
+#permission-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: #0f3460;
+  border-bottom: 1px solid #1a5276;
+  font-size: 12px;
+  color: #7ec8e3;
+}
+
+#grant-btn {
+  padding: 4px 12px;
+  background: #00BCD4;
+  color: #0d0d22;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+#grant-btn:hover {
+  background: #00ACC1;
+}

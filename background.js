@@ -84,73 +84,86 @@ function addEntry(tabId, entry) {
 
 // ─── Network request interception ────────────────────────────────────────────
 
-chrome.webRequest.onResponseStarted.addListener(
-  (details) => {
-    if (details.tabId < 0) return;
-    const contentType = details.responseHeaders
-      ?.find((h) => h.name.toLowerCase() === "content-type")?.value || "";
+let webRequestListenerActive = false;
 
-    const kind = classifyUrl(details.url, contentType);
-    if (!kind) return;
+function webRequestHandler(details) {
+  if (details.tabId < 0) return;
+  const contentType = details.responseHeaders
+    ?.find((h) => h.name.toLowerCase() === "content-type")?.value || "";
 
-    const pathname = new URL(details.url).pathname;
+  const kind = classifyUrl(details.url, contentType);
+  if (!kind) return;
 
-    if (kind === "hls") {
-      const tabId   = details.tabId;
-      const url     = details.url;
-      const filename = pathname.split("/").pop().replace(/\.m3u8.*/, "") || "stream";
+  const pathname = new URL(details.url).pathname;
 
-      // If already known to be a variant of a master, skip it
-      if (knownVariants[tabId]?.has(url)) return;
+  if (kind === "hls") {
+    const tabId   = details.tabId;
+    const url     = details.url;
+    const filename = pathname.split("/").pop().replace(/\.m3u8.*/, "") || "stream";
 
-      // Add optimistically, then classify async
+    // If already known to be a variant of a master, skip it
+    if (knownVariants[tabId]?.has(url)) return;
+
+    // Add optimistically, then classify async
+    addEntry(tabId, {
+      key: url, type: "hls", m3u8Url: url,
+      filename, label: filename, contentType, segmentCount: 0,
+    });
+
+    // Fetch the m3u8 asynchronously to check master vs variant
+    classifyM3u8(tabId, url);
+  }
+
+  if (kind === "ts-segment") {
+    const tabId   = details.tabId;
+    const baseKey = tsStreamKey(details.url);
+    const m3u8Inferred = baseKey + ".m3u8";
+    const filename     = baseKey.split("/").pop() || "stream";
+
+    // Only add ts-segment group if there's no m3u8 entry already covering it
+    if (!tabVideos[tabId]?.[m3u8Inferred]) {
       addEntry(tabId, {
-        key: url, type: "hls", m3u8Url: url,
-        filename, label: filename, contentType, segmentCount: 0,
+        key: baseKey, type: "ts-segment",
+        m3u8Url: m3u8Inferred,
+        filename, label: filename,
+        contentType: "video/MP2T",
+        segmentCount: 1,
       });
-
-      // Fetch the m3u8 asynchronously to check master vs variant
-      classifyM3u8(tabId, url);
+    } else {
+      // Just bump segment count on the existing m3u8 entry
+      const existing = tabVideos[tabId][m3u8Inferred];
+      if (existing) existing.segmentCount = (existing.segmentCount || 0) + 1;
     }
+  }
 
-    if (kind === "ts-segment") {
-      const tabId   = details.tabId;
-      const baseKey = tsStreamKey(details.url);
-      const m3u8Inferred = baseKey + ".m3u8";
-      const filename     = baseKey.split("/").pop() || "stream";
+  if (kind === "direct") {
+    const filename = pathname.split("/").pop().split("?")[0] || "video";
+    addEntry(details.tabId, {
+      key:         details.url,
+      type:        "direct",
+      url:         details.url,
+      filename,
+      label:       filename,
+      contentType,
+      segmentCount: null,
+    });
+  }
+}
 
-      // Only add ts-segment group if there's no m3u8 entry already covering it
-      if (!tabVideos[tabId]?.[m3u8Inferred]) {
-        addEntry(tabId, {
-          key: baseKey, type: "ts-segment",
-          m3u8Url: m3u8Inferred,
-          filename, label: filename,
-          contentType: "video/MP2T",
-          segmentCount: 1,
-        });
-      } else {
-        // Just bump segment count on the existing m3u8 entry
-        const existing = tabVideos[tabId][m3u8Inferred];
-        if (existing) existing.segmentCount = (existing.segmentCount || 0) + 1;
-      }
-    }
+function activateWebRequestListener() {
+  if (webRequestListenerActive) return;
+  chrome.webRequest.onResponseStarted.addListener(
+    webRequestHandler,
+    { urls: ["<all_urls>"] },
+    ["responseHeaders"]
+  );
+  webRequestListenerActive = true;
+}
 
-    if (kind === "direct") {
-      const filename = pathname.split("/").pop().split("?")[0] || "video";
-      addEntry(details.tabId, {
-        key:         details.url,
-        type:        "direct",
-        url:         details.url,
-        filename,
-        label:       filename,
-        contentType,
-        segmentCount: null,
-      });
-    }
-  },
-  { urls: ["<all_urls>"] },
-  ["responseHeaders"]
-);
+// Activate listener on startup if permission was already granted
+chrome.permissions.contains({ origins: ["<all_urls>"] }, (granted) => {
+  if (granted) activateWebRequestListener();
+});
 
 // ─── Async m3u8 classification ────────────────────────────────────────────────
 // Fetches the m3u8 to determine if it's a master playlist.
@@ -242,6 +255,21 @@ async function ensureOffscreen() {
 // ─── Message handling ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+
+  // Permission granted from popup — activate webRequest listener
+  if (message.type === "PERMISSION_GRANTED") {
+    activateWebRequestListener();
+    sendResponse({ ok: true });
+    return;
+  }
+
+  // Check if host permission is granted
+  if (message.type === "CHECK_PERMISSION") {
+    chrome.permissions.contains({ origins: ["<all_urls>"] }, (granted) => {
+      sendResponse({ granted });
+    });
+    return true;
+  }
 
   // Content script reports DOM-found videos
   if (message.type === "ADD_VIDEOS") {

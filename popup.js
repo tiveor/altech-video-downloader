@@ -230,4 +230,40 @@ clearBtn.addEventListener("click", () => {
   renderVideos();
 });
 
-loadVideos();
+// ─── Permission check ────────────────────────────────────────────────────────
+
+function checkPermissionAndLoad() {
+  chrome.runtime.sendMessage({ type: "CHECK_PERMISSION" }, (response) => {
+    if (chrome.runtime.lastError) { loadVideos(); return; }
+    if (response?.granted) {
+      loadVideos();
+    } else {
+      showPermissionBanner();
+      loadVideos(); // still load — DOM scanning works without host permission
+    }
+  });
+}
+
+function showPermissionBanner() {
+  const banner = document.createElement("div");
+  banner.id = "permission-banner";
+  banner.innerHTML = `
+    <span>Enable auto-detection for all sites</span>
+    <button id="grant-btn">Enable</button>
+  `;
+  document.body.insertBefore(banner, statusEl);
+
+  document.getElementById("grant-btn").addEventListener("click", () => {
+    chrome.permissions.request({ origins: ["<all_urls>"] }, (granted) => {
+      if (granted) {
+        chrome.runtime.sendMessage({ type: "PERMISSION_GRANTED" });
+        banner.remove();
+        showStatus("Auto-detection enabled!");
+      } else {
+        showStatus("Permission denied — use Scan to find videos", true);
+      }
+    });
+  });
+}
+
+checkPermissionAndLoad();

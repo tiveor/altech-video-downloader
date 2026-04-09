@@ -7,7 +7,7 @@
 A Chrome extension that detects and downloads videos from web pages, with full support for HLS streaming to MP4 conversion.
 
 [![Chrome Manifest V3](https://img.shields.io/badge/Manifest-V3-0f3460?style=flat-square&logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/mv3/)
-[![Version](https://img.shields.io/badge/version-1.2.0-00BCD4?style=flat-square)](https://github.com/tiveor/altech-video-downloader/releases)
+[![Version](https://img.shields.io/badge/version-1.2.1-00BCD4?style=flat-square)](https://github.com/tiveor/altech-video-downloader/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/tiveor/altech-video-downloader?style=flat-square&color=00BCD4)](https://github.com/tiveor/altech-video-downloader/stargazers)
 [![GitHub Issues](https://img.shields.io/github/issues/tiveor/altech-video-downloader?style=flat-square)](https://github.com/tiveor/altech-video-downloader/issues)

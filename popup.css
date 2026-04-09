@@ -31,12 +31,12 @@ header {
   gap: 8px;
   font-weight: 600;
   font-size: 14px;
-  color: #e94560;
+  color: #00BCD4;
 }
 
 .logo svg {
-  stroke: #e94560;
-  fill: #e94560;
+  stroke: #00BCD4;
+  fill: #00BCD4;
 }
 
 #scan-btn {
@@ -124,8 +124,8 @@ header {
 }
 
 .video-icon svg {
-  stroke: #e94560;
-  fill: #e94560;
+  stroke: #00BCD4;
+  fill: #00BCD4;
 }
 
 .video-info {
@@ -186,7 +186,7 @@ header {
 
 .progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, #e94560, #ff7043);
+  background: linear-gradient(90deg, #00BCD4, #00E5FF);
   border-radius: 2px;
   transition: width 0.3s ease;
   width: 0%;
@@ -202,7 +202,7 @@ header {
   flex-shrink: 0;
   width: 30px;
   height: 30px;
-  background: #e94560;
+  background: #00BCD4;
   border: none;
   border-radius: 6px;
   cursor: pointer;
@@ -213,7 +213,7 @@ header {
 }
 
 .download-btn:hover {
-  background: #c0392b;
+  background: #00ACC1;
   transform: scale(1.05);
 }
 
@@ -276,6 +276,6 @@ footer {
 }
 
 #clear-btn:hover {
-  border-color: #e94560;
-  color: #e94560;
+  border-color: #00BCD4;
+  color: #00BCD4;
 }

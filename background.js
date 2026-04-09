@@ -54,7 +54,7 @@ const knownVariants = {};
 function updateBadge(tabId) {
   const count = Object.keys(tabVideos[tabId] || {}).length;
   chrome.action.setBadgeText({ text: count > 0 ? String(count) : "", tabId });
-  chrome.action.setBadgeBackgroundColor({ color: "#e94560", tabId });
+  chrome.action.setBadgeBackgroundColor({ color: "#00BCD4", tabId });
 }
 
 /**

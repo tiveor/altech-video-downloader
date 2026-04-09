@@ -2,4 +2,4 @@ downloaded/
 *.zip
 .DS_Store
 .claude/
-CHROME_WEB_STORE_GUIDE.md
+chromewebstore/

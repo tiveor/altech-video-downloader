@@ -1,0 +1,18 @@
+{
+  "name": "altech-video-downloader",
+  "version": "1.2.1",
+  "private": true,
+  "description": "Chrome extension to detect and download videos from web pages",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tiveor/altech-video-downloader.git"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "jest": "^30.3.0"
+  }
+}

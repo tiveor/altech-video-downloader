@@ -3,3 +3,5 @@ downloaded/
 .DS_Store
 .claude/
 chromewebstore/
+node_modules/
+coverage/

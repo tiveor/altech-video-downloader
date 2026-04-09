@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build script for Chrome Web Store distribution
-# Usage: bash build.sh
+# Usage: bash scripts/build.sh
 
 set -e
 
@@ -10,7 +10,7 @@ OUTPUT="altech-video-downloader-v${VERSION}.zip"
 echo "Building Altech Video Downloader v${VERSION}..."
 
 # Regenerate icons from SVG
-bash generate-icons.sh
+bash scripts/generate-icons.sh
 
 # Remove previous build if exists
 rm -f "$OUTPUT"

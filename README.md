@@ -70,7 +70,7 @@ A Chrome extension that detects and downloads videos from web pages, with full s
 ### Build for distribution
 
 ```bash
-bash build.sh
+bash scripts/build.sh
 ```
 
 This generates a `altech-video-downloader-v{version}.zip` ready to upload to the Chrome Web Store or share.
@@ -103,11 +103,12 @@ altech-video-downloader/
 ├── popup.js            # Popup logic: rendering, download triggers
 ├── offscreen.html      # Offscreen document for HLS processing
 ├── offscreen.js        # HLS segment fetching, muxing, MP4 container building
-├── build.sh            # Build script for Chrome Web Store packaging
-├── generate-icons.sh   # Icon generation from SVG source
 ├── icons/              # Extension icons (16, 48, 128px)
-└── lib/
-    └── mux.min.js      # mux.js library for TS demuxing
+├── lib/
+│   └── mux.min.js      # mux.js library for TS demuxing
+└── scripts/
+    ├── build.sh         # Build script for Chrome Web Store packaging
+    └── generate-icons.sh # Icon generation from SVG source
 ```
 
 ## Permissions
